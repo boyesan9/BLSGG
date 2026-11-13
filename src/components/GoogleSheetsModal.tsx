@@ -26,7 +26,7 @@ import {
 } from 'lucide-react';
 import {
   createInspectionSpreadsheet,
-  appendInspectionToSheet,
+  syncInspectionsToSheet,
   syncVehiclesToSheet,
   syncStaffToSheet,
   appendAuditLogToSheet,
@@ -41,7 +41,7 @@ import {
   DAMAGE_SHEET_TITLE,
   FUEL_SHEET_TITLE,
 } from '../services/googleSheets';
-import { uploadInspectionMediaToDrive } from '../services/googleDrive';
+import { uploadInspectionMediaToDrive, saveMasterDatabaseToDrive } from '../services/googleDrive';
 import { googleSignIn, getAccessToken } from '../services/firebaseAuth';
 import { getStoredDamageRecords, getStoredFuelLogs } from '../services/storage';
 import { User } from 'firebase/auth';
@@ -63,6 +63,7 @@ interface GoogleSheetsModalProps {
   onSyncBackData?: (data: {
     vehicles: AmbulanceVehicle[];
     staffList: UserProfile[];
+    inspections?: InspectionRecord[];
     inspectionsCount: number;
     damageRecords?: VehicleDamageItem[];
     fuelLogs?: FuelLogRecord[];
@@ -151,19 +152,16 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({
       setSpreadsheetId(res.spreadsheetId);
       onSaveConfig(newConfig);
 
-      // Immediately sync current Fleet, Staff, Damage Records, and Fuel Logs across all 6 tabs
+      // Immediately sync current Inspections, Fleet, Staff, Damage Records, and Fuel Logs across all 6 tabs
+      await syncInspectionsToSheet(res.spreadsheetId, inspections, token);
       await syncVehiclesToSheet(res.spreadsheetId, vehicles, token);
       await syncStaffToSheet(res.spreadsheetId, staffList, token);
 
       const currentDamage = damageRecords || getStoredDamageRecords();
-      if (currentDamage.length > 0) {
-        await syncDamageToSheet(res.spreadsheetId, currentDamage, token);
-      }
+      await syncDamageToSheet(res.spreadsheetId, currentDamage, token);
 
       const currentFuel = fuelLogs || getStoredFuelLogs();
-      if (currentFuel.length > 0) {
-        await syncFuelLogsToSheet(res.spreadsheetId, currentFuel, token);
-      }
+      await syncFuelLogsToSheet(res.spreadsheetId, currentFuel, token);
 
       await appendAuditLogToSheet(
         res.spreadsheetId,
@@ -222,44 +220,50 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({
 
       await ensureAllSpreadsheetTabs(spreadsheetId, token);
 
-      let count = 0;
-      let driveUploadedCount = 0;
+      const syncedInspectionsList: InspectionRecord[] = [];
       for (const rec of inspections) {
-        if (rec.googleSheetsSyncStatus !== 'synced') {
-          let updatedRec = { ...rec };
+        let updatedRec = { ...rec };
 
-          // Upload media to Google Drive if not uploaded yet
-          if (!updatedRec.driveLinks?.folderUrl) {
-            try {
-              const driveLinks = await uploadInspectionMediaToDrive(token, updatedRec);
-              updatedRec.driveLinks = driveLinks;
-              driveUploadedCount++;
-            } catch (dErr) {
-              console.warn('Google Drive upload error for record:', updatedRec.id, dErr);
-            }
+        // Upload media to Google Drive if not uploaded yet
+        if (!updatedRec.driveLinks?.folderUrl) {
+          try {
+            const driveLinks = await uploadInspectionMediaToDrive(token, updatedRec);
+            updatedRec.driveLinks = driveLinks;
+          } catch (dErr) {
+            console.warn('Google Drive upload error for record:', updatedRec.id, dErr);
           }
-
-          await appendInspectionToSheet(spreadsheetId, updatedRec, token);
-          updatedRec.googleSheetsSyncStatus = 'synced';
-          onUpdateInspection(updatedRec);
-          count++;
         }
+
+        updatedRec.googleSheetsSyncStatus = 'synced';
+        onUpdateInspection(updatedRec);
+        syncedInspectionsList.push(updatedRec);
       }
 
-      // Sync active vehicles, staff, damage records, and fuel logs
+      // Sync exact 1:1 tables across all tabs (Inspections, Fleet, Staff, Damage, Fuel)
+      await syncInspectionsToSheet(spreadsheetId, syncedInspectionsList, token);
       await syncVehiclesToSheet(spreadsheetId, vehicles, token);
       await syncStaffToSheet(spreadsheetId, staffList, token);
 
       const currentDamage = damageRecords || getStoredDamageRecords();
-      if (currentDamage.length > 0) {
-        await syncDamageToSheet(spreadsheetId, currentDamage, token);
-      }
+      await syncDamageToSheet(spreadsheetId, currentDamage, token);
 
       const currentFuel = fuelLogs || getStoredFuelLogs();
-      if (currentFuel.length > 0) {
-        await syncFuelLogsToSheet(spreadsheetId, currentFuel, token);
-      }
+      await syncFuelLogsToSheet(spreadsheetId, currentFuel, token);
 
+      // Update Google Drive Master DB Snapshot to match Google Sheets 100%
+      await saveMasterDatabaseToDrive(token, {
+        inspections: syncedInspectionsList,
+        vehicles,
+        staffList,
+        damageRecords: currentDamage,
+        fuelLogs: currentFuel,
+        spreadsheetId,
+        spreadsheetUrl: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+        lastSyncedAt: new Date().toLocaleString('th-TH'),
+        version: 1,
+      }).catch((err) => console.warn('Drive master snapshot warning:', err));
+
+      const count = syncedInspectionsList.length;
       await appendAuditLogToSheet(
         spreadsheetId,
         {
@@ -282,7 +286,7 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({
 
       setStatusMessage({
         type: 'success',
-        text: `ซิงค์ข้อมูลลง Google Sheets ครบถ้วนทั้ง 6 หมวด (ตรวจสภาพ ${count}, กองรถ ${vehicles.length}, เจ้าหน้าที่ ${staffList.length}, รอยรอบคัน ${currentDamage.length}, น้ำมัน ${currentFuel.length})!`,
+        text: `ซิงค์ข้อมูลลง Google Sheets & Drive ครบถ้วนทั้ง 6 หมวด (ตรวจสภาพ ${count}, กองรถ ${vehicles.length}, เจ้าหน้าที่ ${staffList.length}, รอยรอบคัน ${currentDamage.length}, น้ำมัน ${currentFuel.length})!`,
       });
     } catch (err: any) {
       setStatusMessage({

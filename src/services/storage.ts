@@ -275,6 +275,14 @@ export function clearAllInspectionRecords(): InspectionRecord[] {
   return [];
 }
 
+export function replaceAllInspections(records: InspectionRecord[]): InspectionRecord[] {
+  safelyPersistInspections(records);
+  idbClearAllInspections()
+    .then(() => Promise.all(records.map((rec) => idbSaveInspection(rec))))
+    .catch((err) => console.warn('IDB replaceAll warning:', err));
+  return records;
+}
+
 export async function syncInspectionsFromIndexedDb(): Promise<InspectionRecord[]> {
   try {
     const idbRecords = await idbGetAllInspections();
@@ -290,6 +298,7 @@ export async function syncInspectionsFromIndexedDb(): Promise<InspectionRecord[]
 export function clearAllSystemData(clearVehiclesAndStaff = false) {
   try {
     localStorage.setItem(INSPECTIONS_STORAGE_KEY, JSON.stringify([]));
+    idbClearAllInspections().catch(() => {});
     if (clearVehiclesAndStaff) {
       localStorage.setItem(VEHICLES_STORAGE_KEY, JSON.stringify([]));
     }

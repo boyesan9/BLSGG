@@ -26,6 +26,7 @@ import {
   deleteInspectionRecord,
   clearAllInspectionRecords,
   safelyPersistInspections,
+  replaceAllInspections,
   clearAllSystemData,
   resetToInitialDemoData,
   DEMO_USERS,
@@ -62,7 +63,7 @@ import {
   RedirectLoginIntent,
 } from './services/firebaseAuth';
 import {
-  appendInspectionToSheet,
+  syncInspectionsToSheet,
   formatRecordForSheet,
   syncVehiclesToSheet,
   syncStaffToSheet,
@@ -290,10 +291,61 @@ export default function App() {
     });
   };
 
+  // Reconcile Google Sheets inspections with Google Drive / local media & full checklist details
+  const reconcileInspectionsList = (
+    sheetInspections: InspectionRecord[],
+    existingInspections: InspectionRecord[]
+  ): InspectionRecord[] => {
+    const cleanSheetInspections = sheetInspections.filter(
+      (i) => i.id !== 'insp-20261107-001' && i.id !== 'insp-20261106-002'
+    );
+    const localMap = new Map(existingInspections.map((i) => [i.id, i]));
+    return cleanSheetInspections.map((pi) => {
+      const local = localMap.get(pi.id);
+      const mergedDriveLinks = {
+        ...(local?.driveLinks || {}),
+        ...(pi.driveLinks || {}),
+      };
+      return {
+        ...pi,
+        inspectorRole: local?.inspectorRole || pi.inspectorRole,
+        vehicleChecklist:
+          local?.vehicleChecklist &&
+          local.vehicleChecklist.length > 0 &&
+          local.overallStatus === pi.overallStatus
+            ? local.vehicleChecklist
+            : pi.vehicleChecklist,
+        photos: {
+          front:
+            local?.photos?.front ||
+            toDisplayableDriveImageUrl(undefined, mergedDriveLinks.frontPhotoUrl) ||
+            '',
+          rear:
+            local?.photos?.rear ||
+            toDisplayableDriveImageUrl(undefined, mergedDriveLinks.rearPhotoUrl) ||
+            '',
+          left:
+            local?.photos?.left ||
+            toDisplayableDriveImageUrl(undefined, mergedDriveLinks.leftPhotoUrl) ||
+            '',
+          right:
+            local?.photos?.right ||
+            toDisplayableDriveImageUrl(undefined, mergedDriveLinks.rightPhotoUrl) ||
+            '',
+        },
+        documentAttachment: local?.documentAttachment || pi.documentAttachment,
+        driveLinks: Object.keys(mergedDriveLinks).length > 0 ? mergedDriveLinks : undefined,
+        createdAt: local?.createdAt || pi.createdAt,
+        googleSheetsSyncStatus: 'synced',
+      };
+    });
+  };
+
   // Two-way Sync Back handler from Google Sheets (Single Source of Truth)
   const handleSyncBackData = (data: {
     vehicles: AmbulanceVehicle[];
     staffList: UserProfile[];
+    inspections?: InspectionRecord[];
     inspectionsCount: number;
     damageRecords?: VehicleDamageItem[];
     fuelLogs?: FuelLogRecord[];
@@ -325,6 +377,14 @@ export default function App() {
       saveStaff(cleanStaff);
       reconcileCurrentUserWithStaff(cleanStaff);
     }
+    if (data.inspections) {
+      const reconciledInspections = reconcileInspectionsList(data.inspections, getStoredInspections());
+      setInspections(reconciledInspections);
+      replaceAllInspections(reconciledInspections);
+    } else {
+      const storedInspections = getStoredInspections();
+      setInspections(storedInspections);
+    }
     if (data.damageRecords) {
       const cleanDamages = data.damageRecords.filter(
         (d) => d.id !== 'dmg-01' && d.id !== 'dmg-02' && d.id !== 'dmg-03'
@@ -344,14 +404,11 @@ export default function App() {
       setFuelLogs(cleanFuel);
       saveAllFuelLogs(cleanFuel);
     }
-    // Re-hydrate inspections from storage
-    const storedInspections = getStoredInspections();
-    setInspections(storedInspections);
 
     setToastNotification({
       type: 'success',
       title: 'ดึงข้อมูลคืน (Sync Back) สำเร็จทุกฟังก์ชัน',
-      message: `กู้คืนข้อมูลครบถ้วนจาก Google Sheets (รถ ${data.vehicles?.length || 0} คัน, เจ้าหน้าที่ ${data.staffList?.length || 0} คน, รอยรอบตัวรถ ${data.damageRecords?.length || 0} จุด, ประวัติน้ำมัน ${data.fuelLogs?.length || 0} รายการ)`,
+      message: `กู้คืนข้อมูลครบถ้วนจาก Google Sheets (ตรวจสภาพ ${data.inspections?.length ?? data.inspectionsCount ?? 0} รายการ, รถ ${data.vehicles?.length || 0} คัน, เจ้าหน้าที่ ${data.staffList?.length || 0} คน, รอยรอบตัวรถ ${data.damageRecords?.length || 0} จุด, ประวัติน้ำมัน ${data.fuelLogs?.length || 0} รายการ)`,
     });
   };
 
@@ -416,6 +473,8 @@ export default function App() {
       let driveStats = '';
       let resolvedSheetId = googleSheetsConfig.spreadsheetId;
 
+      let driveInspectionsSnapshot: InspectionRecord[] = getStoredInspections();
+
       try {
         const driveData = await loadMasterDatabaseFromDrive(token);
         if (driveData) {
@@ -457,13 +516,14 @@ export default function App() {
             const cleanDriveInspections = driveData.inspections.filter(
               (i) => i.id !== 'insp-20261107-001' && i.id !== 'insp-20261106-002'
             );
+            driveInspectionsSnapshot = cleanDriveInspections;
             setInspections(cleanDriveInspections);
-            safelyPersistInspections(cleanDriveInspections);
+            replaceAllInspections(cleanDriveInspections);
           }
           if (driveData.spreadsheetId && !resolvedSheetId) {
             resolvedSheetId = driveData.spreadsheetId;
           }
-          driveStats = `(รถ ${driveData.vehicles?.length || 0} คัน, รอยตัวรถ ${driveData.damageRecords?.length || 0} จุด, น้ำมัน ${driveData.fuelLogs?.length || 0} รายการ)`;
+          driveStats = `(ตรวจสภาพ ${driveData.inspections?.length || 0} รายการ, รถ ${driveData.vehicles?.length || 0} คัน, รอยตัวรถ ${driveData.damageRecords?.length || 0} จุด, น้ำมัน ${driveData.fuelLogs?.length || 0} รายการ)`;
         }
       } catch (driveErr) {
         console.warn('Phase 1 (Google Drive Load) warning:', driveErr);
@@ -530,6 +590,14 @@ export default function App() {
             reconcileCurrentUserWithStaff(cleanSheetStaff);
           }
 
+          // Reconcile Inspections: Google Sheets is the Single Source of Truth, enriched by Drive media/checklist
+          let finalInspections = driveInspectionsSnapshot;
+          if (pulled.inspections) {
+            finalInspections = reconcileInspectionsList(pulled.inspections, driveInspectionsSnapshot);
+            setInspections(finalInspections);
+            replaceAllInspections(finalInspections);
+          }
+
           // Reconcile Damage Records: Google Sheets is the Single Source of Truth!
           if (pulled.damageRecords) {
             const cleanSheetDamages = pulled.damageRecords.filter(
@@ -586,13 +654,18 @@ export default function App() {
           setGoogleSheetsConfig(updatedConf);
           saveGoogleSheetsConfig(updatedConf);
 
-          // ซิงค์บันทึก Snapshot คืนสู่ Google Drive เพื่อให้ตรงกัน 100%
+          const latestVehs = getStoredVehicles();
+          const latestDmg = getStoredDamageRecords();
+          const latestFuel = getStoredFuelLogs();
+          driveStats = `(ตรวจสภาพ ${finalInspections.length} รายการ, รถ ${latestVehs.length} คัน, รอยตัวรถ ${latestDmg.length} จุด, น้ำมัน ${latestFuel.length} รายการ)`;
+
+          // ซิงค์บันทึก Snapshot คืนสู่ Google Drive เพื่อให้ตรงกับ Google Sheets 100%
           const snapshotPayload: MasterDatabasePayload = {
-            inspections: getStoredInspections(),
-            vehicles: getStoredVehicles(),
+            inspections: finalInspections,
+            vehicles: latestVehs,
             staffList: getStoredStaff(),
-            damageRecords: getStoredDamageRecords(),
-            fuelLogs: getStoredFuelLogs(),
+            damageRecords: latestDmg,
+            fuelLogs: latestFuel,
             spreadsheetId: resolvedSheetId,
             spreadsheetUrl: updatedConf.spreadsheetUrl,
             lastSyncedAt: new Date().toLocaleString('th-TH'),
@@ -843,9 +916,13 @@ export default function App() {
           syncErrors.push(`Google Drive: ${formatted.message}`);
         }
 
-        // Sync row with Google Drive links to Google Sheets
+        // Sync full inspection table 1:1 with Google Drive & App
         try {
-          await appendInspectionToSheet(spreadsheetId, recordToSave, token);
+          const mirroredList = [
+            { ...recordToSave, googleSheetsSyncStatus: 'synced' as const },
+            ...getStoredInspections().filter((r) => r.id !== recordToSave.id),
+          ];
+          await syncInspectionsToSheet(spreadsheetId, mirroredList, token);
           recordToSave.googleSheetsSyncStatus = 'synced';
         } catch (sheetErr: any) {
           const formatted = formatGoogleApiError(sheetErr?.message || 'บันทึกแถวไม่สำเร็จ', 'Google Sheets API');
@@ -937,14 +1014,16 @@ export default function App() {
       }
 
       const sheetId = googleSheetsConfig.spreadsheetId;
-      if (sheetId) {
-        await appendInspectionToSheet(sheetId, updatedRecord, token);
-        updatedRecord.googleSheetsSyncStatus = 'synced';
-      }
-
+      updatedRecord.googleSheetsSyncStatus = sheetId ? 'synced' : updatedRecord.googleSheetsSyncStatus;
       updateInspectionRecord(updatedRecord);
-      setInspections(getStoredInspections());
+      const latestInspections = getStoredInspections();
+      setInspections(latestInspections);
       setSelectedRecordDetail(updatedRecord);
+
+      if (sheetId) {
+        await syncInspectionsToSheet(sheetId, latestInspections, token);
+      }
+      await saveCurrentDatabaseSnapshotToDrive(token);
 
       setToastNotification({
         type: 'success',
@@ -981,9 +1060,25 @@ export default function App() {
       setSelectedRecordDetail(null);
     }
 
-    const { token } = await ensureTokenAndSheet(false);
+    const { token, spreadsheetId } = await ensureTokenAndSheet(false);
     if (token) {
-      await saveCurrentDatabaseSnapshotToDrive(token);
+      try {
+        if (spreadsheetId) {
+          await syncInspectionsToSheet(spreadsheetId, updated, token);
+        }
+        await saveCurrentDatabaseSnapshotToDrive(token);
+      } catch (err: any) {
+        console.warn('Delete inspection cloud sync warning:', err?.message || err);
+        const formatted = formatGoogleApiError(err?.message || 'ไม่สามารถอัปเดต Google Sheets ได้', 'Google Sheets API');
+        setToastNotification({
+          type: 'error',
+          title: 'ลบในเครื่องแล้ว แต่ซิงค์ Google Sheets/Drive ขัดข้อง',
+          message: formatted.message,
+          linkUrl: formatted.activationUrl,
+          linkText: formatted.activationUrl ? 'เปิดหน้าเปิดใช้งาน API ใน Google Cloud' : undefined,
+        });
+        return;
+      }
     }
 
     logSystemActivityAndSyncSheets(
@@ -996,7 +1091,7 @@ export default function App() {
     setToastNotification({
       type: 'info',
       title: 'ลบประวัติการตรวจแล้ว',
-      message: 'ลบรายการบันทึกการตรวจสภาพรถออกจากระบบและอัปเดตสำรองข้อมูล Google Drive เรียบร้อยแล้ว',
+      message: 'ลบรายการบันทึกการตรวจสภาพรถออกจากระบบ พร้อมอัปเดต Google Sheets & Google Drive เรียบร้อยแล้ว',
     });
   };
 
@@ -1015,8 +1110,11 @@ export default function App() {
     setInspections(emptyList);
     setSelectedRecordDetail(null);
 
-    const { token } = await ensureTokenAndSheet(false);
+    const { token, spreadsheetId } = await ensureTokenAndSheet(false);
     if (token) {
+      if (spreadsheetId) {
+        await syncInspectionsToSheet(spreadsheetId, [], token).catch(console.warn);
+      }
       await saveCurrentDatabaseSnapshotToDrive(token);
     }
 
@@ -1030,7 +1128,7 @@ export default function App() {
     setToastNotification({
       type: 'info',
       title: 'ล้างประวัติการตรวจทั้งหมดแล้ว',
-      message: 'เคลียร์ตารางประวัติการตรวจสภาพรถทั้งหมดเรียบร้อยแล้ว พร้อมสำหรับการทดสอบระบบใหม่',
+      message: 'เคลียร์ตารางประวัติการตรวจสภาพรถในแอป, Google Sheets และ Google Drive เรียบร้อยแล้ว',
     });
   };
 
@@ -1067,8 +1165,11 @@ export default function App() {
 
     const { token, spreadsheetId } = await ensureTokenAndSheet(false);
     if (token) {
-      if (clearFleetAndStaff && spreadsheetId) {
-        await syncVehiclesToSheet(spreadsheetId, [], token).catch(console.warn);
+      if (spreadsheetId) {
+        await syncInspectionsToSheet(spreadsheetId, [], token).catch(console.warn);
+        if (clearFleetAndStaff) {
+          await syncVehiclesToSheet(spreadsheetId, [], token).catch(console.warn);
+        }
       }
       await saveCurrentDatabaseSnapshotToDrive(token);
     }

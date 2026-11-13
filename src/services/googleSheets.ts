@@ -372,6 +372,56 @@ export async function appendInspectionToSheet(
 }
 
 /**
+ * Mirror / Sync entire Inspections list to Tab 1 (บันทึกการตรวจรถกู้ชีพ_BLS)
+ * Clears stale/deleted rows and writes exact 1:1 records matching Google Drive & App
+ */
+export async function syncInspectionsToSheet(
+  spreadsheetId: string,
+  records: InspectionRecord[],
+  accessToken: string
+): Promise<void> {
+  await ensureAllSpreadsheetTabs(spreadsheetId, accessToken);
+
+  const clearUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(
+    INSPECTION_SHEET_TITLE
+  )}!A2:R2000:clear`;
+
+  const clearRes = await fetch(clearUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (!clearRes.ok) {
+    const errorJson = await clearRes.json().catch(() => ({}));
+    throw new Error(errorJson.error?.message || `เกิดข้อผิดพลาดในการล้างข้อมูลเดิมในชีตตรวจสภาพรถ (${clearRes.status})`);
+  }
+
+  if (records.length === 0) return;
+
+  const rows = records.map(formatRecordForSheet);
+  const putUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(
+    INSPECTION_SHEET_TITLE
+  )}!A2:R${rows.length + 1}?valueInputOption=USER_ENTERED`;
+
+  const response = await fetch(putUrl, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ values: rows }),
+  });
+
+  if (!response.ok) {
+    const errorJson = await response.json().catch(() => ({}));
+    throw new Error(errorJson.error?.message || `เกิดข้อผิดพลาดในการซิงค์ตารางตรวจสภาพรถลง Google Sheets (${response.status})`);
+  }
+}
+
+/**
  * Sync entire Fleet list to Tab 2 (รายการรถกู้ชีพ_BLS)
  */
 export async function syncVehiclesToSheet(
@@ -544,6 +594,7 @@ export async function pullAllDataFromGoogleSheets(
 ): Promise<{
   vehicles: AmbulanceVehicle[];
   staffList: UserProfile[];
+  inspections: InspectionRecord[];
   inspectionsCount: number;
   damageRecords: VehicleDamageItem[];
   fuelLogs: FuelLogRecord[];
@@ -637,19 +688,105 @@ export async function pullAllDataFromGoogleSheets(
     }
   }
 
-  // 3. Count Inspections
+  // 3. Pull Inspections (Tab 1: บันทึกการตรวจรถกู้ชีพ_BLS)
   const inspUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(
     INSPECTION_SHEET_TITLE
-  )}!A2:A1000`;
+  )}!A2:R1000`;
   const inspRes = await fetch(inspUrl, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
 
-  let inspectionsCount = 0;
+  const inspections: InspectionRecord[] = [];
   if (inspRes.ok) {
     const data = await inspRes.json();
-    inspectionsCount = (data.values || []).filter((r: any) => r && r[0]).length;
+    const rows: string[][] = data.values || [];
+    for (let idx = 0; idx < rows.length; idx++) {
+      const r = rows[idx];
+      if (r && r[0] && r[2]) {
+        const vehCode = r[2].trim();
+        const plateNum = (r[3] || '').trim();
+        const matchedVeh = vehicles.find(
+          (v) => v.code === vehCode || (plateNum && v.plateNumber === plateNum)
+        );
+
+        const inspectorName = (r[4] || '').trim() || 'เจ้าหน้าที่';
+        const matchedStaff = staffList.find((s) => s.name === inspectorName);
+
+        const shiftLabel = (r[1] || '').trim() || 'เวร 24 ชั่วโมง (08:00 น. - 08:00 น. ของอีกวัน)';
+        const shift: InspectionRecord['shift'] = shiftLabel.includes('เช้า')
+          ? 'morning'
+          : shiftLabel.includes('บ่าย')
+          ? 'afternoon'
+          : shiftLabel.includes('ดึก')
+          ? 'night'
+          : '24hr';
+
+        const statusCell = (r[5] || '').trim();
+        const overallStatus: InspectionRecord['overallStatus'] =
+          statusCell.includes('งดใช้งาน') || statusCell.includes('ส่งซ่อม')
+            ? 'needs_repair'
+            : statusCell.includes('พบข้อบกพร่อง') || statusCell.includes('เฝ้าระวัง')
+            ? 'issue_found'
+            : 'normal';
+
+        const checklist = createFreshChecklist();
+        for (let catId = 1; catId <= 7; catId++) {
+          const catCell = (r[6 + catId] || '').trim();
+          const isFail = catCell.includes('❌') || catCell.includes('ไม่ผ่าน');
+          const isWarn = !isFail && (catCell.includes('⚠️') || catCell.includes('เฝ้าระวัง'));
+          if (isFail || isWarn) {
+            const catItems = checklist.filter((c) => c.categoryId === catId);
+            const matchedAnySub = catItems.some((item) => catCell.includes(item.subTitle));
+            for (const item of catItems) {
+              if (!matchedAnySub || catCell.includes(item.subTitle)) {
+                item.status = isFail ? 'fail' : 'warning';
+              }
+            }
+          }
+        }
+
+        const rawNotes = (r[14] || '').trim();
+        const summaryNotes = rawNotes && rawNotes !== 'ไม่มีปัญหาที่พบ' ? rawNotes : '';
+
+        const docUrlMatch = (r[15] || '').match(/https:\/\/[^\s|]+/);
+        const folderUrlMatch = (r[16] || '').match(/https:\/\/[^\s|]+/);
+
+        const recordId = (r[17] || '').trim() || `insp-sheet-${vehCode}-${idx + 1}`;
+
+        inspections.push({
+          id: recordId,
+          vehicleId: matchedVeh?.id || `veh-${vehCode}`,
+          vehicleCode: vehCode,
+          plateNumber: plateNum || matchedVeh?.plateNumber || '',
+          shift,
+          shiftLabel,
+          inspectorName,
+          inspectorRole: matchedStaff?.role || 'staff',
+          odometerReading: Number(String(r[6] || '').replace(/[^0-9.]/g, '')) || 0,
+          vehicleChecklist: checklist,
+          photos: {
+            front: '',
+            rear: '',
+            left: '',
+            right: '',
+          },
+          summaryNotes,
+          overallStatus,
+          uploadTimestamp: r[0].trim(),
+          createdAt: Date.now() - idx * 1000,
+          googleSheetsSyncStatus: 'synced',
+          driveLinks:
+            docUrlMatch || folderUrlMatch
+              ? {
+                  documentUrl: docUrlMatch?.[0],
+                  folderUrl: folderUrlMatch?.[0],
+                }
+              : undefined,
+        });
+      }
+    }
   }
+  const inspectionsCount = inspections.length;
 
   // 4. Pull Damage Records
   const damageUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(
@@ -750,6 +887,7 @@ export async function pullAllDataFromGoogleSheets(
   return {
     vehicles,
     staffList,
+    inspections,
     inspectionsCount,
     damageRecords,
     fuelLogs,
