@@ -1764,7 +1764,7 @@ export default function App() {
           googleUser={googleUser}
         />
         {toastNotification && (
-          <div className="fixed bottom-5 right-5 z-50 max-w-md animate-in fade-in slide-in-from-bottom-3">
+          <div className="fixed bottom-5 right-5 z-70 max-w-md animate-in fade-in slide-in-from-bottom-3">
             <div
               className={`rounded-2xl border p-4 shadow-xl backdrop-blur-md ${
                 toastNotification.type === 'success'
@@ -1972,7 +1972,7 @@ export default function App() {
 
       {/* Toast Notification */}
       {toastNotification && (
-        <div className="fixed bottom-5 right-5 z-50 max-w-md animate-in fade-in slide-in-from-bottom-3">
+        <div className="fixed bottom-5 right-5 z-70 max-w-md animate-in fade-in slide-in-from-bottom-3">
           <div
             className={`rounded-2xl border p-4 shadow-xl backdrop-blur-md ${
               toastNotification.type === 'success'

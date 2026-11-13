@@ -210,13 +210,8 @@ export const googleSignIn = async (options?: {
       saveRedirectIntent(options.intent);
     }
 
-    // ในเบราว์เซอร์ทั่วไป / Vercel / มือถือ: ใช้ signInWithRedirect เพื่อเปลี่ยนหน้าไปยัง Google ทันที (เลี่ยงปัญหาป๊อปอัพ)
-    if (!isEmbeddedInIframe()) {
-      await signInWithRedirect(auth, provider);
-      return { redirected: true };
-    }
-
-    // กรณีเปิดใช้งานอยู่ภายใน iframe (เช่น AI Studio Preview) Google บล็อกการโหลดหน้าล็อกอินใน iframe จึงต้องใช้ Popup แทน
+    // ใช้ signInWithPopup เป็นหลักทั้งบน AI Studio และ Vercel (ร่วมกับ COOP same-origin-allow-popups ใน vercel.json)
+    // เพื่อหลีกเลี่ยงปัญหา Third-Party Storage Partitioning ที่ทำให้ getRedirectResult คืนค่า null เมื่อ authDomain เป็น firebaseapp.com
     const result = await signInWithPopup(auth, provider);
     const credential = GoogleAuthProvider.credentialFromResult(result);
     if (!credential?.accessToken) {
@@ -227,6 +222,18 @@ export const googleSignIn = async (options?: {
     consumeRedirectIntent();
     return { user: result.user, accessToken: credential.accessToken, redirected: false };
   } catch (error: any) {
+    // หากถูกบล็อกป๊อปอัพบนเบราว์เซอร์ปกติ (ไม่ได้อยู่ใน iframe) ให้สลับไปใช้ signInWithRedirect อัตโนมัติ
+    if (error?.code === 'auth/popup-blocked' && !isEmbeddedInIframe()) {
+      try {
+        await signInWithRedirect(auth, provider);
+        return { redirected: true };
+      } catch (redirectErr: any) {
+        consumeRedirectIntent();
+        console.warn('Google Sign-in redirect fallback warning:', redirectErr?.code || redirectErr?.message);
+        throw formatFirebaseAuthError(redirectErr);
+      }
+    }
+
     consumeRedirectIntent();
     console.warn('Google Sign-in warning:', error?.code || error?.message);
     throw formatFirebaseAuthError(error);
